@@ -1,0 +1,10 @@
+datasets
+evaluate
+transformers[torch]
+sentencepiece
+accelerate
+nltk
+pycocoevalcap
+absl-py
+rouge_score
+
