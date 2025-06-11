@@ -3,6 +3,9 @@
 Link dataset: [https://huggingface.co/datasets/Skyler215/KTVIC](https://huggingface.co/datasets/Skyler215/KTVIC)
 
 ## Train model
+
+**WARNING**: Training code hiện tại không chạy được vì train dataset không có preprocessed images. Code sẽ được cập nhật trong thời gian tới.
+
 1. Tải KTVIC dataset
 2. Cài đặt Java (nếu muốn evaluate CIDEr)
 3. Cài đặt pytorch 2.5.1 theo hướng dẫn trên website

@@ -160,6 +160,7 @@ class CustomMetricCallback(TrainerCallback):
         super().__init__()
 
         # Get test dataset
+        # EDIT: Change the dataset paths to your own dataset paths
         test_dataset = get_dataset(
             "ktvic_dataset/public-test-images", "ktvic_dataset/test_data.json"
         )
@@ -228,22 +229,23 @@ class CustomMetricCallback(TrainerCallback):
             f.write("BLEU-4 metric not available\n")
 
         # %%
-        try:
-            cider = evaluate.load("Kamichanw/CIDEr")
-            results = cider.compute(
-                predictions=predicted_output, references=self.test_captions
-            )
-            print(results)
-            f.write(f"CIDEr: {results}\n")
+        # EDIT: Uncomment this to enable cider evaluation, only if you have Java installed
+        # try:
+        #     cider = evaluate.load("Kamichanw/CIDEr")
+        #     results = cider.compute(
+        #         predictions=predicted_output, references=self.test_captions
+        #     )
+        #     print(results)
+        #     f.write(f"CIDEr: {results}\n")
 
-            if results["CIDEr"] > self.max_cider_score:
-                self.max_cider_score = results["CIDEr"]
-                # Save the model with epoch number in the name
-                model.save_pretrained(f"model_epoch_{state.epoch}")
-                print(f"Model saved with CIDEr score: {self.max_cider_score}")
-        except Exception:
-            print("CIDEr metric not available")
-            f.write("CIDEr metric not available\n")
+        #     if results["CIDEr"] > self.max_cider_score:
+        #         self.max_cider_score = results["CIDEr"]
+        #         # Save the model with epoch number in the name
+        #         model.save_pretrained(f"model_epoch_{state.epoch}")
+        #         print(f"Model saved with CIDEr score: {self.max_cider_score}")
+        # except Exception:
+        #     print("CIDEr metric not available")
+        #     f.write("CIDEr metric not available\n")
 
         # %%
         try:
@@ -304,10 +306,12 @@ if __name__ == "__main__":
     print(summary(model))
 
     # %%
+    # EDIT: Disable tf32 training if not supported
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     # %%
+    # EDIT: Change the training arguments as needed
     # Training arguments
     training_args = TrainingArguments(
         output_dir="output",
@@ -316,7 +320,7 @@ if __name__ == "__main__":
         dataloader_num_workers=12,
         # gradient_checkpointing=True,
         bf16=True,
-        tf32=True,
+        tf32=True, # EDIT: Disable tf32 training if not supported
         save_strategy="epoch",
         save_total_limit=1,
         logging_dir="logs",
