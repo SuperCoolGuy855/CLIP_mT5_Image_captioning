@@ -1,28 +1,37 @@
-import os
-import json
-import pandas as pd
-import gc
-from time import sleep
-
-import torch
-import torch.nn as nn
-
-from datasets import Dataset, Image as HuggingFaceImage
-import nltk
-import evaluate
+# %%
 from transformers import (
-    MT5ForConditionalGeneration,
-    MT5Tokenizer,
-    TrainingArguments,
-    Trainer,
-    CLIPModel,
-    CLIPProcessor,
-    PreTrainedModel,
     PretrainedConfig,
-    TrainerCallback
+    PreTrainedModel,
+    CLIPModel,
+    CLIPVisionModel,
+    MT5ForConditionalGeneration,
+    CLIPImageProcessorFast,
+    MT5Tokenizer,
+    Trainer,
+    TrainingArguments,
+    TrainerCallback,
 )
+from torchvision.transforms.v2 import (
+    Compose,
+    RandomVerticalFlip,
+    RandomHorizontalFlip,
+    RandomGrayscale,
+)
+from torchinfo import summary
+from datasets import Dataset, Image as HFImage
+from torch import nn
+from PIL import Image
+from tqdm import trange
+import evaluate
+import nltk
+import torch
+import numpy as np
+import json
+import os
+import gc
 
 
+# %%
 def freeze_model_layers(model):
     """
     Completely prevent any layer from being updated
@@ -31,299 +40,315 @@ def freeze_model_layers(model):
         param.requires_grad = False
 
 
-class CLIPMT5ImageCaptioningConfig(PretrainedConfig):
-    model_type = "image_captioning"
-
-    def __init__(
-        self,
-        clip_model_name="openai/clip-vit-base-patch32",
-        mt5_model_name="google/mt5-small",
-        **kwargs,
-    ):
+# %%
+class ImageCaptionConfig(PretrainedConfig):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.clip_model_name = clip_model_name
-        self.mt5_model_name = mt5_model_name
+        self.clip_name = "facebook/metaclip-h14-fullcc2.5b"
+        self.mt5_name = "google/mt5-base"
 
 
-class CLIPMT5ImageCaptioningModel(PreTrainedModel):
-    config_class = CLIPMT5ImageCaptioningConfig
+# %%
+class ImageCaptionModel(PreTrainedModel):
+    config_class = ImageCaptionConfig
 
     def __init__(self, config):
         super().__init__(config)
-        self.clip = CLIPModel.from_pretrained(config.clip_model_name)
-        # self.clip_preprocess = CLIPProcessor.from_pretrained(config.clip_model_name)
-        self.mt5 = MT5ForConditionalGeneration.from_pretrained(config.mt5_model_name)
-        self.tokenizer = MT5Tokenizer.from_pretrained(config.mt5_model_name)
+        self.clip = CLIPVisionModel.from_pretrained(config.clip_name)
+        self.mt5 = MT5ForConditionalGeneration.from_pretrained(config.mt5_name)
 
-        clip_output_dim = self.clip.config.projection_dim
-        mt5_input_dim = self.mt5.config.d_model
-        self.projection = nn.Linear(clip_output_dim, mt5_input_dim)
+        self.projection = nn.Sequential(
+            nn.Linear(self.clip.config.hidden_size, self.mt5.config.d_model),
+            nn.GELU(),
+            nn.LayerNorm(self.mt5.config.d_model),
+            nn.Dropout(0.1), # HYPERPARAMETER to be tuned
+        )
 
-        # Freeze CLIP
+        # Freeze the CLIP model
         freeze_model_layers(self.clip)
 
-        # Freeze MT5
-        # freeze_model_layers(self.mt5)
+        # Freeze most bottom layers of MT5 decoder
+        freeze_model_layers(self.mt5.decoder.block[:-2])
 
-    def forward(self, images, captions):
-        # Encode images using CLIP
-        image_features = self.clip.get_image_features(images)
-        image_embeddings = self.projection(image_features)
+        self.main_input_name = "pixel_values"
 
-        # Prepare inputs for MT5
-        # labels = self.tokenizer(captions, return_tensors="pt", padding=True, truncation=True, max_length=self.config.max_caption_length)
-        outputs = self.mt5(
-            inputs_embeds=image_embeddings.unsqueeze(1),
-            labels=captions,
-        )
-        return {
-            "loss": outputs.loss,
-            # "logits": outputs.logits,
-        }
+    def get_image_features(self, pixel_values):
+        clip_output = self.clip(pixel_values=pixel_values, return_dict=False)[0]
+        # normalized_output = self.clip.vision_model.post_layernorm(clip_output) # TODO: Check if this is correct
+        casted_output = clip_output.to(torch.float32)
+        projection_embed = self.projection(casted_output)
+        return projection_embed
 
-    def generate(self, images):
+    def forward(self, pixel_values, labels):
+        image_features = self.get_image_features(pixel_values)
+        mt5_output = self.mt5(inputs_embeds=image_features, labels=labels)
+
+        return mt5_output
+
+    def generate(self, pixel_values, max_length=96):
         with torch.no_grad():
-            image_features = self.clip.get_image_features(images)
-            image_embeddings = self.projection(image_features)
-            outputs = self.mt5.generate(inputs_embeds=image_embeddings.unsqueeze(1))
-            return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            image_features = self.get_image_features(pixel_values)
+            mt5_output = self.mt5.generate(
+                inputs_embeds=image_features, max_length=max_length
+            )
 
-# Callback for evaluation after each epoch
-class EvaluationCallback(TrainerCallback):
+        return mt5_output
+
+
+# %%
+def get_dataset(dataset_folder: str, json_path: str):
+    data = json.load(open(json_path, encoding="utf-8"))
+
+    image_map = {}
+    for item in data["images"]:
+        image_path = os.path.join(dataset_folder, item["filename"])
+        image_map[item["id"]] = image_path
+
+    caption_map = {}
+    for item in data["annotations"]:
+        if item["image_id"] not in caption_map:
+            caption_map[item["image_id"]] = []
+        caption_map[item["image_id"]].append(item["caption"])
+
+    dataset_dict = {"images": [], "captions": []}
+    for image_id, image_path in image_map.items():
+        dataset_dict["images"].append(image_path)
+        dataset_dict["captions"].append(caption_map[image_id])
+
+    dataset = Dataset.from_dict(dataset_dict)
+    casted_dataset = dataset.cast_column("images", HFImage())
+    casted_dataset.set_format("pt")
+
+    return casted_dataset
+
+
+# %%
+def get_training_dataset():
+    # return get_dataset(r"ktvic_dataset/train-images", r"ktvic_dataset/train_data.json")
+    return Dataset.load_from_disk(r"train_dataset")
+
+
+# %%
+config = ImageCaptionConfig()
+
+# %%
+# Preprocess the dataset, randomly flipping the images, and tokenizing the captions
+tokenizer = MT5Tokenizer.from_pretrained(config.mt5_name)
+processor = CLIPImageProcessorFast.from_pretrained(config.clip_name)
+
+
+def preprocess_function(examples):
+    flip = Compose(
+        [RandomVerticalFlip(p=0.5), RandomHorizontalFlip(p=0.5), RandomGrayscale(p=0.1)]
+    )
+    images = flip(torch.tensor(examples["pixel_values"]))
+    captions = tokenizer(
+        examples["labels"], padding=True, truncation=True, return_tensors="pt"
+    )
+
+    return {"pixel_values": images, "labels": captions["input_ids"]}
+
+
+def preprocess_images(examples):
+    pixel_values = processor(examples["images"], return_tensors="pt").pixel_values
+    return {"images": pixel_values}
+
+
+# %%
+class CustomMetricCallback(TrainerCallback):
     def __init__(self):
         super().__init__()
-        nltk.download("wordnet")
-        
-        with open(f"{dataset_root}/test_data.json", encoding="utf8") as f:
-            test_data = json.load(f)
 
-        image_metadata = test_data["images"]
-        annotations = test_data["annotations"]
-    
-        image_index = {
-            image["id"]: (f"{dataset_root}/public-test-images/{image['filename']}", [])
-            for image in image_metadata
-        }
-    
-        for x in annotations:
-            # image_name = image_index[x["image_id"]]["filename"]
-            # image_paths.append(f"{dataset_root}/public-test-images/{image_name}")
-            # captions.append(x["caption"])
-            image_index[x["image_id"]][1].append(x["caption"])
-    
-        image_paths = []
-        captions = []
-    
-        for image_path, caption_list in image_index.values():
-            image_paths.append(image_path)
-            captions.append(caption_list)
-    
-        test_dict = {
-            "images": image_paths,
-            "captions": captions,
-        }
-    
-        test_df = pd.DataFrame(test_dict)
-        test_dataset = Dataset.from_pandas(test_df).cast_column(
-            "images", HuggingFaceImage()
+        # Get test dataset
+        test_dataset = get_dataset(
+            "ktvic_dataset/public-test-images", "ktvic_dataset/test_data.json"
         )
-        print(test_dataset)
-    
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        def test_transforms(example_batch):
-            preprocess_image = processor(
-                images=example_batch["images"], padding=True, return_tensors="pt"
-            )
-            return {
-                "images": preprocess_image.pixel_values,
-                "captions": example_batch["captions"],
-            }
-    
-        test_preprocess_dataset = test_dataset.map(
-            test_transforms, batched=True, batch_size=16
-        )
-        test_preprocess_dataset.set_format("torch")
-        print(test_preprocess_dataset)
-    
-        self.test_images = test_preprocess_dataset["images"]
-        self.test_captions = test_preprocess_dataset["captions"]
+        test_dataset = test_dataset.map(preprocess_images, batched=True, batch_size=12)
+        test_dataset.set_format("pt")
 
-    def on_epoch_end(self, args, state, control, model, **kwargs):
-        # model = kwargs["model"]
+        # Get test images tensor and move to device
+        test_images = test_dataset["images"]
+
+        # Get test captions
+        test_captions = test_dataset["captions"]
+
+        self.test_images = test_images
+        self.test_captions = test_captions
+        self.max_cider_score = np.float64(0.0)
+
+    def on_epoch_end(self, args, state, control, model: ImageCaptionModel, **kwargs):
+        # Print total_flos for funnies
+        print(f"Total FLOPS: {state.total_flos}")
+
+        # Set model to eval mode
         model.eval()
-    
+
+        # Transfer test images to device
+        self.test_images = self.test_images.to(model.device)
+
+        # Generate predictions in batches
+        batch_size = 16
         predicted_output = []
+        for i in trange(0, len(self.test_images), batch_size):
+            batch = self.test_images[i : i + batch_size]
+            output = model.generate(batch)
+            output = output.cpu().numpy().tolist()
+            predicted_output.extend(output)
 
-        for i in range(0, len(self.test_images), 16):
-            batch_images = self.test_images[i : i + 16]
-            batch_images = batch_images.to(device)
-            batch_output = model.generate(batch_images)
-            predicted_output.extend(batch_output)
-            del batch_images
-        # print(predicted_output)
-    
-        bleu = evaluate.load("bleu")
-        results_1 = bleu.compute(
-            predictions=predicted_output, references=self.test_captions, max_order=1
+        predicted_output = tokenizer.batch_decode(
+            predicted_output, skip_special_tokens=True
         )
-        print(results_1)
-    
-        results_4 = bleu.compute(predictions=predicted_output, references=self.test_captions)
-        print(results_4)
-    
-        meteor = evaluate.load("meteor")
-        results = meteor.compute(predictions=predicted_output, references=self.test_captions)
-        print(results)
-    
-        rouge = evaluate.load("rouge")
-        results = rouge.compute(predictions=predicted_output, references=self.test_captions)
-        print(results, flush=True)
 
-        # EDIT: Uncomment this to enable cider evaluation, only if you have Java installed
-        #cider = evaluate.load("Kamichanw/CIDEr")
-        #results = cider.compute(predictions=predicted_output, references=self.test_captions)
-        #print(results)
+        # Open metric file in append mode
+        f = open("metrics.txt", "a")
 
+        # Write the epoch number
+        f.write(f"Epoch: {state.epoch}\n")
+
+        try:
+            bleu = evaluate.load("bleu")
+            results_1 = bleu.compute(
+                predictions=predicted_output, references=self.test_captions, max_order=1
+            )
+            print(results_1)
+            f.write(f"BLEU-1: {results_1}\n")
+        except Exception:
+            print("BLEU-1 metric not available")
+            f.write("BLEU-1 metric not available\n")
+
+        # %%
+        try:
+            results_4 = bleu.compute(
+                predictions=predicted_output, references=self.test_captions
+            )
+            print(results_4)
+            f.write(f"BLEU-4: {results_4}\n")
+        except Exception:
+            print("BLEU-4 metric not available")
+            f.write("BLEU-4 metric not available\n")
+
+        # %%
+        try:
+            cider = evaluate.load("Kamichanw/CIDEr")
+            results = cider.compute(
+                predictions=predicted_output, references=self.test_captions
+            )
+            print(results)
+            f.write(f"CIDEr: {results}\n")
+
+            if results["CIDEr"] > self.max_cider_score:
+                self.max_cider_score = results["CIDEr"]
+                # Save the model with epoch number in the name
+                model.save_pretrained(f"model_epoch_{state.epoch}")
+                print(f"Model saved with CIDEr score: {self.max_cider_score}")
+        except Exception:
+            print("CIDEr metric not available")
+            f.write("CIDEr metric not available\n")
+
+        # %%
+        try:
+            meteor = evaluate.load("meteor")
+            results = meteor.compute(
+                predictions=predicted_output, references=self.test_captions
+            )
+            print(results)
+            f.write(f"METEOR: {results}\n")
+        except Exception:
+            print("METEOR metric not available")
+            f.write("METEOR metric not available\n")
+
+        # %%
+        try:
+            rouge = evaluate.load("rouge")
+            results = rouge.compute(
+                predictions=predicted_output, references=self.test_captions
+            )
+            print(results)
+            f.write(f"ROUGE: {results}\n")
+        except Exception:
+            print("ROUGE metric not available")
+            f.write("ROUGE metric not available\n")
+
+        # Close the file
+        f.close()
+
+        # Set model back to train mode
         model.train()
+
+        # Transfer test images back to cpu
+        self.test_images = self.test_images.to("cpu")
+
+        # Scrub VRAM and cache
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(device)
+    # torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
 
-    
-    # EDIT: Change this to the path of the dataset
-    dataset_root = "ktvic_dataset"
+    # %%
+    train_dataset = get_training_dataset()
+    # Cut the dataset to 100 samples for testing
+    # train_dataset = train_dataset.select(range(100))
 
-    # Prepare train dataset
-    with open(f"{dataset_root}/train_data.json", encoding="utf8") as f:
-        train_data = json.load(f)
+    # %%
+    train_dataset.set_transform(preprocess_function)
 
-    image_metadata = train_data["images"]
-    annotations = train_data["annotations"]
+    # %%
+    # Create model
+    model = ImageCaptionModel(config)
 
-    image_index = {image["id"]: image for image in image_metadata}
+    # Examine the model
+    print(model)
 
-    image_paths = []
-    captions = []
+    print(summary(model))
 
-    for x in annotations:
-        image_name = image_index[x["image_id"]]["filename"]
-        image_paths.append(f"{dataset_root}/train-images/{image_name}")
-        captions.append(x["caption"])
-
-    train_dict = {
-        "images": image_paths,
-        "captions": captions,
-    }
-
-    train_df = pd.DataFrame(train_dict)
-    train_dataset = Dataset.from_pandas(train_df).cast_column(
-        "images", HuggingFaceImage()
-    )
-    print(train_dataset)
-
-    config = CLIPMT5ImageCaptioningConfig(
-        clip_model_name="openai/clip-vit-base-patch32",
-        mt5_model_name="google/mt5-large",
-        max_caption_length=192,
-    )
-
-    processor = CLIPProcessor.from_pretrained(config.clip_model_name)
-    tokenizer = MT5Tokenizer.from_pretrained(config.mt5_model_name)
-    
-    # Preprocess the images in the dataset
-    def process_image(example_batch):
-        # images = [x for x in example_batch["images"]]
-        # captions = example_batch["captions"]
-        preprocess_image = processor(
-            images=example_batch["images"], padding=True, return_tensors="pt"
-        )
-        # labels = tokenizer(
-        #     example_batch["captions"],
-        #     return_tensors="pt",
-        #     padding="max_length",
-        #     truncation=True,
-        #     max_length=config.max_caption_length,
-        # )
-        # labels = tokenizer(example_batch["captions"], return_tensors="pt", padding=True)
-        return {
-            "images": preprocess_image.pixel_values,
-            "captions": example_batch["captions"],
-        }
-    
-    # Transform the captions into tokenized form
-    # Doing a separate preprocessing step for the captions to make the batched captions length equal
-    def text_transform(example_batch):
-        labels = tokenizer(
-            example_batch["captions"],
-            return_tensors="pt",
-            padding=True,
-        )
-        return {
-            "images": torch.tensor(example_batch["images"]),
-            "captions": labels.input_ids,
-        }
-
-    train_preprocess_dataset = train_dataset.map(
-        process_image, batched=True, batch_size=16, num_proc=6
-    )
-    train_preprocess_dataset.set_format("torch")
-    train_preprocess_dataset.set_transform(text_transform)
-    print(train_preprocess_dataset[0]["images"].shape)
-    print(train_preprocess_dataset[0]["captions"].shape)
-
-    # train_preprocess_dataset = train_dataset.with_transform(transforms)
-    # # train_preprocess_dataset.set_format("torch")
-    # print(train_preprocess_dataset)
-
-    # Create the model
-    model = CLIPMT5ImageCaptioningModel(config)
-
-    # Print the number of parameters
-    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
-
-    mt5_p_count = sum(p.numel() for p in model.mt5.parameters() if p.requires_grad)
-    print(mt5_p_count)
-
-    clip_p_count = sum(p.numel() for p in model.clip.parameters() if p.requires_grad)
-    print(clip_p_count)
-
-    projection_p_count = sum(
-        p.numel() for p in model.projection.parameters() if p.requires_grad
-    )
-    print(projection_p_count)
-
-    total_p_count = mt5_p_count + clip_p_count + projection_p_count
-    print(total_p_count)
-
-    os.environ["WANDB_DISABLED"] = "true"
-
-    # EDIT: Disable tf32 training if not supported
+    # %%
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # EDIT: Change the training arguments as needed
+    # %%
+    # Training arguments
     training_args = TrainingArguments(
-        output_dir="./mt5_large_results",
+        output_dir="output",
         num_train_epochs=20,
-        per_device_train_batch_size=64,
+        per_device_train_batch_size=32,
         dataloader_num_workers=12,
         # gradient_checkpointing=True,
         bf16=True,
-        tf32=True, # EDIT: Disable tf32 training if not supported
-        logging_strategy="epoch",
+        tf32=True,
         save_strategy="epoch",
-        report_to=None,
+        save_total_limit=1,
+        logging_dir="logs",
+        logging_strategy="steps",
+        logging_steps=500,
+        # use_cpu = True,
         dataloader_persistent_workers=True,
     )
 
-    # Initialize Trainer
+    # %%
+    callbacks = CustomMetricCallback()
+
+    # Trainer
     trainer = Trainer(
-        model=model, args=training_args, train_dataset=train_preprocess_dataset, callbacks=[EvaluationCallback]
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        callbacks=[callbacks],
     )
 
-    # Start fine-tuning
-    trainer.train()
+    # %%
+    # Train the model
+    trainer.train(resume_from_checkpoint=True)
 
-    trainer.save_model("clip_mt5_large_model")
+    # %%
+    # Save the model
+    # trainer.save_model("model")
+
+    # %%
+    del trainer
+    del model
+    del train_dataset
+    del tokenizer
+    torch.cuda.empty_cache()
+    gc.collect()

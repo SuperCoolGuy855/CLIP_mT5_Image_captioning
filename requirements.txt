@@ -1,10 +1,11 @@
+transformers
 datasets
+Pillow
+tqdm
 evaluate
-transformers[torch]
+nltk
 sentencepiece
 accelerate
-nltk
 pycocoevalcap
-absl-py
 rouge_score
-
+torchinfo
