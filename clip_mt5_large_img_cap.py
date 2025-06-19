@@ -124,8 +124,9 @@ def get_dataset(dataset_folder: str, json_path: str):
 
 # %%
 def get_training_dataset():
-    # return get_dataset(r"ktvic_dataset/train-images", r"ktvic_dataset/train_data.json")
-    return Dataset.load_from_disk(r"train_dataset")
+    # EDIT: Change the dataset paths to your own dataset paths
+    return get_dataset(r"ktvic_dataset/train-images", r"ktvic_dataset/train_data.json")
+    # return Dataset.load_from_disk(r"train_dataset")
 
 
 # %%
